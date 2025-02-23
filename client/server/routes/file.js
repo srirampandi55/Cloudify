@@ -3,6 +3,7 @@ import express from "express";
 import multer from "multer";
 import dotenv from "dotenv";
 import crypto from "crypto";
+import authMiddleware from "../middleware/authMiddleware.js";
 import File from "../models/File.js";
 
 dotenv.config();
@@ -16,7 +17,11 @@ if (!fs.existsSync(uploadDir)) {
 
 // **🔹 Multer Storage Configuration**
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
+  destination: (req, file, cb) => {
+    const userFolder = `${uploadDir}/${req.user.id}`;
+    if (!fs.existsSync(userFolder)) fs.mkdirSync(userFolder, { recursive: true });
+    cb(null, userFolder);
+  },
   filename: (req, file, cb) => {
     const uniqueName = crypto.randomBytes(10).toString("hex") + "-" + file.originalname;
     cb(null, uniqueName);
@@ -31,8 +36,8 @@ const fileFilter = (req, file, cb) => {
 
 const upload = multer({ storage, fileFilter });
 
-// **🔹 Upload File API**
-router.post("/upload", upload.single("file"), async (req, res) => {
+// **🔹 Upload File API (🔐 Protected)**
+router.post("/upload", authMiddleware, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
@@ -40,8 +45,8 @@ router.post("/upload", upload.single("file"), async (req, res) => {
       filename: req.file.filename,
       fileType: req.file.mimetype,
       fileSize: req.file.size,
-      fileUrl: `/uploads/${req.file.filename}`,
-      uploadedBy: req.body.userId
+      fileUrl: `/uploads/${req.user.id}/${req.file.filename}`,
+      uploadedBy: req.user.id
     });
 
     await file.save();
@@ -51,23 +56,35 @@ router.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// **🔹 Rename File API**
-router.put("/rename/:id", async (req, res) => {
+// **🔹 Get Files for Logged-in User**
+router.get("/my-files", authMiddleware, async (req, res) => {
+  try {
+    const files = await File.find({ uploadedBy: req.user.id });
+    res.json({ files });
+  } catch (err) {
+    res.status(500).json({ message: "Error fetching files", error: err.message });
+  }
+});
+
+// **🔹 Rename File API (User must own the file)**
+router.put("/rename/:id", authMiddleware, async (req, res) => {
   try {
     const { newFilename } = req.body;
     if (!newFilename) return res.status(400).json({ message: "New filename is required" });
 
     const file = await File.findById(req.params.id);
-    if (!file) return res.status(404).json({ message: "File not found" });
+    if (!file || file.uploadedBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: "Unauthorized action" });
+    }
 
-    const oldPath = `${uploadDir}/${file.filename}`;
-    const newPath = `${uploadDir}/${newFilename}`;
+    const oldPath = `${uploadDir}/${req.user.id}/${file.filename}`;
+    const newPath = `${uploadDir}/${req.user.id}/${newFilename}`;
 
     if (!fs.existsSync(oldPath)) return res.status(400).json({ message: "File does not exist on server" });
 
     fs.renameSync(oldPath, newPath);
     file.filename = newFilename;
-    file.fileUrl = `/uploads/${newFilename}`;
+    file.fileUrl = `/uploads/${req.user.id}/${newFilename}`;
     await file.save();
 
     res.json({ message: "File renamed successfully", file });
@@ -76,13 +93,15 @@ router.put("/rename/:id", async (req, res) => {
   }
 });
 
-// **🔹 Delete File API**
-router.delete("/:id", async (req, res) => {
+// **🔹 Delete File API (Only Owner)**
+router.delete("/:id", authMiddleware, async (req, res) => {
   try {
     const file = await File.findById(req.params.id);
-    if (!file) return res.status(404).json({ message: "File not found" });
+    if (!file || file.uploadedBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: "Unauthorized action" });
+    }
 
-    const filePath = `${uploadDir}/${file.filename}`;
+    const filePath = `${uploadDir}/${req.user.id}/${file.filename}`;
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
 
     await file.deleteOne();
@@ -92,25 +111,27 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
-// **🔹 Move File API (Organize into Folders)**
-router.put("/move/:id", async (req, res) => {
+// **🔹 Move File API (Only Owner)**
+router.put("/move/:id", authMiddleware, async (req, res) => {
   try {
     const { newFolder } = req.body;
     if (!newFolder) return res.status(400).json({ message: "New folder name is required" });
 
     const file = await File.findById(req.params.id);
-    if (!file) return res.status(404).json({ message: "File not found" });
+    if (!file || file.uploadedBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: "Unauthorized action" });
+    }
 
-    const folderPath = `${uploadDir}/${newFolder}`;
+    const folderPath = `${uploadDir}/${req.user.id}/${newFolder}`;
     if (!fs.existsSync(folderPath)) fs.mkdirSync(folderPath, { recursive: true });
 
-    const oldPath = `${uploadDir}/${file.filename}`;
+    const oldPath = `${uploadDir}/${req.user.id}/${file.filename}`;
     const newPath = `${folderPath}/${file.filename}`;
 
     if (!fs.existsSync(oldPath)) return res.status(400).json({ message: "File does not exist on server" });
 
     fs.renameSync(oldPath, newPath);
-    file.fileUrl = `/uploads/${newFolder}/${file.filename}`;
+    file.fileUrl = `/uploads/${req.user.id}/${newFolder}/${file.filename}`;
     await file.save();
 
     res.json({ message: "File moved successfully", file });
@@ -119,22 +140,14 @@ router.put("/move/:id", async (req, res) => {
   }
 });
 
-// **🔹 Get Files for Specific User**
-router.get("/user/:userId", async (req, res) => {
-  try {
-    const files = await File.find({ uploadedBy: req.params.userId }).populate("uploadedBy", "username");
-    res.json({ files });
-  } catch (err) {
-    res.status(500).json({ message: "Error fetching files", error: err.message });
-  }
-});
-
 // **🔹 Generate Shareable Link API**
-router.post("/share/:id", async (req, res) => {
+router.post("/share/:id", authMiddleware, async (req, res) => {
   try {
     const { accessType, sharedWith } = req.body;
     const file = await File.findById(req.params.id);
-    if (!file) return res.status(404).json({ message: "File not found" });
+    if (!file || file.uploadedBy.toString() !== req.user.id) {
+      return res.status(403).json({ message: "Unauthorized action" });
+    }
 
     const shareToken = crypto.randomBytes(16).toString("hex");
     file.accessType = accessType;
