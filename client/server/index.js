@@ -29,7 +29,7 @@ app.use(express.json({ limit: "10mb" }));
 // **🔹 Rate Limiting**
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 500, // Limit increased
+  max: 500, // Allow 500 requests per window
   message: "Too many requests, please try again later.",
 });
 app.use(limiter);
@@ -43,7 +43,7 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (!origin || allowedOrigins.includes(origin) || process.env.NODE_ENV !== "production") {
         callback(null, true);
       } else {
         callback(new Error("CORS Policy Blocked This Request"));
@@ -53,10 +53,10 @@ app.use(
   })
 );
 
-app.options("*", cors());
+app.options("*", cors()); // Allow preflight requests
 
 // **🔹 Serve Static Files (Uploads)**
-app.use("/uploads", express.static(path.join(__dirname, "uploads"))); // ✅ Fixed `__dirname` issue
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // **🔹 API Routes**
 app.use("/api/auth", authRoutes);
@@ -71,11 +71,7 @@ app.get("/", (req, res) => {
 // **🔹 MongoDB Connection**
 const connectDB = async () => {
   try {
-    await mongoose.connect(process.env.MONGO_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      serverSelectionTimeoutMS: 5000,
-    });
+    await mongoose.connect(process.env.MONGO_URI);
     console.log("✅ MongoDB Connected");
   } catch (err) {
     console.error("❌ MongoDB Connection Error:", err.message);
@@ -83,6 +79,16 @@ const connectDB = async () => {
   }
 };
 connectDB();
+
+// **🔹 MongoDB Auto-Reconnect Handling**
+mongoose.connection.on("error", (err) => {
+  console.error("❌ MongoDB Connection Error:", err);
+});
+
+mongoose.connection.on("disconnected", () => {
+  console.warn("🔻 MongoDB Disconnected. Reconnecting...");
+  connectDB();
+});
 
 // **🔹 Global Error Handling**
 app.use((err, req, res, next) => {
